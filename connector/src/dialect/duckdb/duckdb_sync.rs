@@ -255,16 +255,43 @@ pub fn export(
   file: &str,
   format: &str,
 ) -> anyhow::Result<()> {
-  let sql = if format == "xlsx" {
-    format!("INSTALL excel; LOAD excel; COPY ({sql}) TO '{file}' (FORMAT xlsx, HEADER true)")
-  } else if format == "parquet" {
-    format!("COPY ({sql}) TO '{file}' (FORMAT {format}, compression ZSTD)")
+  if format == "xlsx" {
+    // 对于XLSX格式，使用rust_xlsxwriter直接写入，避免联网下载DuckDB Excel扩展
+    use crate::utils::write_xlsx;
+    let (titles, batch) = query_arrow_to_batch(conn, sql)?;
+    write_xlsx(file, &batch)?;
+    Ok(())
   } else {
-    format!("COPY ({sql}) TO '{file}' (FORMAT {format})")
-  };
-  log::warn!("export sql: {}", &sql);
-  let _ = conn.execute(&sql, [])?;
-  Ok(())
+    let sql = if format == "parquet" {
+      format!("COPY ({sql}) TO '{file}' (FORMAT {format}, compression ZSTD)")
+    } else {
+      format!("COPY ({sql}) TO '{file}' (FORMAT {format})")
+    };
+    log::warn!("export sql: {}", &sql);
+    let _ = conn.execute(&sql, [])?;
+    Ok(())
+  }
+}
+
+// 辅助函数：将DuckDB查询结果转换为Arrow RecordBatch
+fn query_arrow_to_batch(conn: &duckdb::Connection, sql: &str) -> anyhow::Result<(Vec<Title>, RecordBatch)> {
+  let mut stmt = conn.prepare(sql)?;
+  let frames = stmt.query_arrow(duckdb::params![])?;
+  let schema = frames.get_schema();
+  let records: Vec<_> = frames.collect();
+
+  let titles: Vec<_> = stmt
+    .column_names()
+    .iter()
+    .enumerate()
+    .map(|(i, name)| Title {
+      name: name.clone(),
+      r#type: MyDataType(stmt.column_type(i)).to_string(),
+    })
+    .collect();
+
+  let batch = arrow::compute::concat_batches(&schema, &records)?;
+  Ok((titles, batch))
 }
 
 #[test]
